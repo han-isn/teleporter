@@ -16,12 +16,20 @@ Teleporter reads a source session, packs the **most recent transcript** (up to ~
 ## Install
 
 ```bash
-cargo install --path .
+cargo install agent-teleporter
 ```
+
+Installs the `teleporter` binary to `~/.cargo/bin` (keep that on your `PATH`).
 
 Requires the target CLI (`codex`, `grok`, or `claude`) on your `PATH`.
 
-On macOS, if `teleporter` exits with `zsh: killed` (invalid code signature after a manual copy), reinstall with `cargo install` or resign:
+From a local clone (dev):
+
+```bash
+cargo install --path . --force
+```
+
+On macOS, if `teleporter` exits with `zsh: killed` (invalid code signature), resign:
 
 ```bash
 codesign --force --sign - "$(which teleporter)"

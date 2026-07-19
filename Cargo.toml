@@ -1,12 +1,20 @@
 [package]
-name = "teleporter"
+name = "agent-teleporter"
 version = "0.1.0"
 edition = "2021"
 description = "Teleport coding-agent conversations between Codex, Grok, and Claude Code"
 license = "MIT"
 readme = "README.md"
+repository = "https://github.com/han-isn/teleporter"
+homepage = "https://github.com/han-isn/teleporter"
+documentation = "https://github.com/han-isn/teleporter"
 keywords = ["cli", "codex", "grok", "claude", "handoff"]
 categories = ["command-line-utilities", "development-tools"]
+exclude = [".teleporter/", "target/"]
+
+[[bin]]
+name = "teleporter"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.103"
