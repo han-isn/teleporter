@@ -1,0 +1,6 @@
+{"timestamp":"2026-07-16T11:36:28.000Z","type":"session_meta","payload":{"id":"019f0045-d606-7923-94af-2b615b362c83","cwd":"/tmp/teleporter-fixture","source":"cli"}}
+{"timestamp":"2026-07-16T11:36:29.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"fix the login bug in src/auth.ts"}]}}
+{"timestamp":"2026-07-16T11:36:30.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"I'll inspect src/auth.ts"}]}}
+{"timestamp":"2026-07-16T11:36:31.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"sed -n 1,40p src/auth.ts"}}
+{"timestamp":"2026-07-16T11:36:32.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","output":[{"type":"input_text","text":"ok"}]}}
+{"timestamp":"2026-07-16T11:36:33.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"also add tests"}]}}
