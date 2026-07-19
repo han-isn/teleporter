@@ -1,3 +1,4 @@
+use ratatui::layout::Alignment;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -51,30 +52,27 @@ pub fn tool() -> Style {
     Style::default().fg(TOOL)
 }
 
-/// Full TELEPORTER wordmark — same family as Codex / Claude CLI splash art.
+/// Reliable TELEPORTER mark — half-blocks only (no box-drawing; those break in many terminals).
 pub fn pixel_logo_full() -> &'static [&'static str] {
     &[
-        "████████╗███████╗██╗     ███████╗██████╗  ██████╗ ██████╗ ████████╗███████╗██████╗",
-        "╚══██╔══╝██╔════╝██║     ██╔════╝██╔══██╗██╔═══██╗██╔══██╗╚══██╔══╝██╔════╝██╔══██╗",
-        "   ██║   █████╗  ██║     █████╗  ██████╔╝██║   ██║██████╔╝   ██║   █████╗  ██████╔╝",
-        "   ██║   ██╔══╝  ██║     ██╔══╝  ██╔═══╝ ██║   ██║██╔══██╗   ██║   ██╔══╝  ██╔══██╗",
-        "   ██║   ███████╗███████╗███████╗██║     ╚██████╔╝██║  ██║   ██║   ███████╗██║  ██║",
-        "   ╚═╝   ╚══════╝╚══════╝╚══════╝╚═╝      ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝",
+        "█████ █████ █     █████ █████  ███  █████ █████ █████ █████",
+        "  █   █▀▀▀▀ █     █▀▀▀▀ █   █ █   █ █   █   █   █▀▀▀▀ █   █",
+        "  █   ████  █     ████  █████ █   █ ████    █   ████  ████ ",
+        "  █   █▄▄▄▄ █████ █▄▄▄▄ █      ███  █  █    █   █▄▄▄▄ █  █ ",
     ]
 }
 
-/// Narrow-terminal fallback (README compact mark).
+/// Narrow terminals.
 pub fn pixel_logo_compact() -> &'static [&'static str] {
     &[
-        "▄▄▄▄▄ ▄▄▄ ▄   ▄▄▄ ▄▄▄▄ ▄▄▄ ▄▄▄ ▄▄▄▄▄ ▄▄▄ ▄▄▄",
-        "  █   █▄  █   █▄  █▄▄█ █▄█ █▄█   █   █▄  █▄█",
-        "  █   █▄▄ █▄▄ █▄▄ █    █ █ █ █   █   █▄▄ █ █",
+        "█▀▀█ █▀▀ █   █▀▀ █▀█ █▀█ █▀▄ ▀█▀ █▀▀ █▀▄",
+        "  █  █▀▀ █   █▀▀ █▀▀ █ █ ██▄  █  █▀▀ ██ ",
+        "  █  █▄▄ █▄▄ █▄▄ █   █▄█ █ █  █  █▄▄ █ █",
     ]
 }
 
 pub fn pixel_logo_for(width: u16) -> &'static [&'static str] {
-    // Full mark is ~82 cols; keep a little margin.
-    if width >= 86 {
+    if width >= 64 {
         pixel_logo_full()
     } else {
         pixel_logo_compact()
@@ -84,8 +82,18 @@ pub fn pixel_logo_for(width: u16) -> &'static [&'static str] {
 pub fn logo_lines_for(width: u16) -> Vec<Line<'static>> {
     pixel_logo_for(width)
         .iter()
-        .map(|l| Line::from(Span::styled(*l, logo_style())))
+        .map(|l| {
+            Line::from(Span::styled(*l, logo_style())).alignment(Alignment::Center)
+        })
         .collect()
+}
+
+pub fn tagline() -> Line<'static> {
+    Line::from(Span::styled(
+        "conversation handoff  ·  codex ↔ grok ↔ claude",
+        muted(),
+    ))
+    .alignment(Alignment::Center)
 }
 
 pub fn print_splash() {

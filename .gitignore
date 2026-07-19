@@ -1,4 +1,5 @@
 /target
+.teleporter/
 .teleporter-handoff.md
 .DS_Store
 *.swp

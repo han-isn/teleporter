@@ -86,7 +86,14 @@ impl Adapter for CodexAdapter {
                     let title = head
                         .first_user
                         .as_deref()
-                        .map(|s| truncate_title(s, 120))
+                        .map(|s| {
+                            let facing = super::common::extract_user_facing(s);
+                            if facing.is_empty() || super::common::is_noise_title(&facing) {
+                                truncate_title(s, 120)
+                            } else {
+                                truncate_title(&facing, 120)
+                            }
+                        })
                         .unwrap_or_else(|| id.clone());
                     sessions.push(SessionSummary {
                         tool: Tool::Codex,
@@ -340,13 +347,8 @@ fn parse_rollout(path: &Path) -> Result<Transcript> {
     }
 
     let last_user_request = super::common::derive_last_user(&turns);
-
-    let title = turns
-        .iter()
-        .find(|t| t.role == TurnRole::User)
-        .map(|t| truncate_title(&t.text, 120))
-        .unwrap_or_else(|| id.clone());
-
+    let title = super::common::derive_title(&turns, &id);
+    files.retain(|p| super::common::is_useful_file_mention(p));
     files.truncate(20);
 
     Ok(Transcript {
@@ -408,13 +410,12 @@ fn message_text(payload: &Value) -> Option<String> {
 
 fn looks_like_injected_context(text: &str) -> bool {
     let t = text.trim_start();
-    t.starts_with("<permissions")
-        || t.starts_with("<INSTRUCTIONS>")
+    t.starts_with('<')
         || t.starts_with("# AGENTS.md")
-        || t.starts_with("<multi_agent")
-        || t.starts_with("<recommended_plugins>")
         || t.starts_with("You are `/root`")
         || t.starts_with("You are Codex")
+        || t.contains("environment_context")
+        || super::common::is_noise_user_text(t)
 }
 
 fn summarize_tool_input(name: &str, v: &Value) -> String {
@@ -422,30 +423,101 @@ fn summarize_tool_input(name: &str, v: &Value) -> String {
         Value::String(s) => s.clone(),
         other => other.to_string(),
     };
-    // Prefer path/command fragments over patch blobs.
-    if s.contains("Begin Patch") || s.contains("Update File:") {
-        if let Some(path) = s.lines().find_map(|l| {
-            l.trim()
-                .strip_prefix("*** Update File:")
-                .or_else(|| l.trim().strip_prefix("*** Add File:"))
-                .map(str::trim)
-        }) {
-            return truncate_chars(&format!("edit {path}"), 120);
-        }
-        return "edit files".into();
+    // Codex often embeds apply_patch inside JS strings with `\n` escapes.
+    if let Some(edit) = summarize_embedded_patch(&s) {
+        return edit;
     }
     // Codex often wraps shell as JS: exec_command({cmd:"..."
     if let Some(cmd) = extract_cmd_literal(&s) {
         return truncate_chars(&cmd, 100);
     }
-    if name == "exec" || name == "shell" {
+    let n = name.to_ascii_lowercase();
+    if matches!(
+        n.as_str(),
+        "exec" | "shell" | "bash" | "shell_command" | "exec_command"
+    ) {
         if let Ok(obj) = serde_json::from_str::<Value>(&s) {
-            if let Some(cmd) = obj.get("cmd").and_then(|c| c.as_str()) {
-                return truncate_chars(cmd, 100);
+            if let Some(cmd) = command_from_json(&obj) {
+                return truncate_chars(&cmd, 100);
+            }
+        }
+        return truncate_chars(&s, 100);
+    }
+    truncate_chars(&s, 100)
+}
+
+/// Decode JS-escaped apply_patch blobs → `edit path (+N/−M)`.
+fn summarize_embedded_patch(s: &str) -> Option<String> {
+    if !(s.contains("Begin Patch") || s.contains("Update File:") || s.contains("Add File:")) {
+        return None;
+    }
+    let normalized = s
+        .replace("\\r\\n", "\n")
+        .replace("\\n", "\n")
+        .replace("\\t", "\t")
+        .replace("\\\"", "\"");
+    let mut first_path: Option<String> = None;
+    let mut file_count = 0usize;
+    let mut plus = 0usize;
+    let mut minus = 0usize;
+    for line in normalized.lines() {
+        let t = line.trim();
+        let t = t.trim_matches(|c| c == '"' || c == '\'');
+        if let Some(p) = t
+            .strip_prefix("*** Update File:")
+            .or_else(|| t.strip_prefix("*** Add File:"))
+            .or_else(|| t.strip_prefix("Update File:"))
+            .or_else(|| t.strip_prefix("Add File:"))
+        {
+            let p = p.trim().trim_matches('"').to_string();
+            if !p.is_empty() {
+                file_count += 1;
+                if first_path.is_none() {
+                    first_path = Some(p);
+                }
+            }
+            continue;
+        }
+        if t.starts_with('+') && !t.starts_with("+++") {
+            plus += 1;
+        } else if t.starts_with('-') && !t.starts_with("---") {
+            minus += 1;
+        }
+    }
+    let path = first_path?;
+    let short = if let Some(i) = path.find("/src/") {
+        format!("src/{}", &path[i + 5..])
+    } else if let Some(i) = path.rfind('/') {
+        path[i + 1..].to_string()
+    } else {
+        path
+    };
+    let mut out = if plus > 0 || minus > 0 {
+        format!("edit {short} (+{plus}/−{minus})")
+    } else {
+        format!("edit {short}")
+    };
+    if file_count > 1 {
+        out.push_str(&format!(" · {file_count} files"));
+    }
+    Some(truncate_chars(&out, 120))
+}
+
+fn command_from_json(obj: &Value) -> Option<String> {
+    for key in ["command", "cmd"] {
+        if let Some(s) = obj.get(key).and_then(|c| c.as_str()) {
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+        if let Some(arr) = obj.get(key).and_then(|c| c.as_array()) {
+            let parts: Vec<&str> = arr.iter().filter_map(|x| x.as_str()).collect();
+            if !parts.is_empty() {
+                return Some(parts.join(" "));
             }
         }
     }
-    truncate_chars(&s, 100)
+    None
 }
 
 fn extract_cmd_literal(s: &str) -> Option<String> {
@@ -475,19 +547,34 @@ fn extract_cmd_literal(s: &str) -> Option<String> {
 }
 
 fn summarize_tool_output(v: &Value, max: usize) -> String {
-    if let Some(arr) = v.as_array() {
+    let raw = if let Some(arr) = v.as_array() {
         let mut parts = Vec::new();
         for item in arr {
             if let Some(t) = item.get("text").and_then(|x| x.as_str()) {
                 parts.push(t);
             }
         }
-        return truncate_chars(&parts.join(" "), max);
+        parts.join(" ")
+    } else if let Some(s) = v.as_str() {
+        s.to_string()
+    } else {
+        v.to_string()
+    };
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("wall time")
+        || lower.contains("cell id")
+        || lower.starts_with("script completed")
+        || lower.starts_with("script running")
+    {
+        if lower.contains("error") || lower.contains("fail") {
+            return "fail".into();
+        }
+        return "ok".into();
     }
-    if let Some(s) = v.as_str() {
-        return truncate_chars(s, max);
+    if raw.contains("Begin Patch") || raw.len() > max {
+        return "ok".into();
     }
-    truncate_chars(&v.to_string(), max)
+    truncate_chars(&raw, max)
 }
 
 fn truncate_chars(s: &str, max: usize) -> String {
@@ -563,5 +650,15 @@ mod tests {
             tx.last_user_request.as_deref(),
             Some("fix the login bug in src/auth.ts")
         );
+    }
+
+    #[test]
+    fn summarizes_js_escaped_apply_patch() {
+        let input = r#"const patch = "*** Begin Patch\n*** Update File: /tmp/demo/src/auth.ts\n@@\n-old\n+new\n+line2\n*** End Patch";"#;
+        let out = summarize_tool_input("exec", &Value::String(input.into()));
+        assert!(out.starts_with("edit "), "{out}");
+        assert!(out.contains("auth.ts"), "{out}");
+        assert!(out.contains('+'), "{out}");
+        assert!(!out.contains("edit files"), "{out}");
     }
 }

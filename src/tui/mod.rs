@@ -11,14 +11,14 @@ use crossterm::terminal::{
 use ratatui::Frame;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::adapters;
 use crate::brand::{self, DANGER};
-use crate::catalog::{self, ModelInfo};
+use crate::catalog::{self, EffortChoice, FastChoice, ModelInfo};
 use crate::launch;
 use crate::model::{Handoff, SessionSummary, Tool};
 use crate::teleport;
@@ -27,9 +27,16 @@ use crate::teleport;
 enum Step {
     From,
     Session,
-    To,
-    Model,
+    Dest,
+    Effort,
+    Fast,
     Preview,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DestFocus {
+    Target,
+    Model,
 }
 
 pub struct App {
@@ -37,15 +44,18 @@ pub struct App {
     from: Tool,
     to: Tool,
     model: ModelInfo,
+    effort: EffortChoice,
+    fast: FastChoice,
     cwd: PathBuf,
-    /// Full list from disk (unfiltered).
     all_sessions: Vec<SessionSummary>,
-    /// Filtered view for the session list.
     sessions: Vec<SessionSummary>,
     session_state: ListState,
     tool_state: ListState,
     to_state: ListState,
     model_state: ListState,
+    effort_state: ListState,
+    fast_state: ListState,
+    dest_focus: DestFocus,
     filter: String,
     auto_send: bool,
     handoff: Option<Handoff>,
@@ -60,18 +70,27 @@ impl App {
         session_state.select(Some(0));
         let mut tool_state = ListState::default();
         tool_state.select(Some(0));
+        let from = Tool::Codex;
+        let to = first_target(from);
         let mut to_state = ListState::default();
-        to_state.select(Some(1));
-        let to = Tool::Grok;
+        to_state.select(Some(0));
         let model = catalog::default_model(to);
+        let effort = catalog::default_effort(to, model);
+        let fast = catalog::default_fast(to);
         let mut model_state = ListState::default();
         model_state.select(Some(0));
+        let mut effort_state = ListState::default();
+        effort_state.select(Some(0));
+        let mut fast_state = ListState::default();
+        fast_state.select(Some(0));
 
         let mut app = Self {
             step: Step::From,
-            from: Tool::Codex,
+            from,
             to,
             model,
+            effort,
+            fast,
             cwd,
             all_sessions: Vec::new(),
             sessions: Vec::new(),
@@ -79,30 +98,91 @@ impl App {
             tool_state,
             to_state,
             model_state,
+            effort_state,
+            fast_state,
+            dest_focus: DestFocus::Target,
             filter: String::new(),
-            // Default on: soft mode opens an empty CLI and feels broken.
             auto_send: true,
             handoff: None,
             preview_scroll: 0,
-            status: "select source · auto-send on".into(),
+            status: "where is the conversation?".into(),
             error: None,
         };
         app.reload_sessions();
         app
     }
 
-    fn sync_model_list(&mut self) {
-        let list = catalog::models_for(self.to);
-        self.model = list[0];
-        self.model_state.select(Some(0));
+    fn targets(&self) -> Vec<Tool> {
+        target_tools(self.from)
     }
 
-    fn selected_model(&self) -> ModelInfo {
+    fn has_fast_step(&self) -> bool {
+        catalog::fast_options_for(self.to).is_some()
+    }
+
+    fn sync_target_from_state(&mut self) {
+        let targets = self.targets();
+        if targets.is_empty() {
+            return;
+        }
+        let i = self
+            .to_state
+            .selected()
+            .unwrap_or(0)
+            .min(targets.len() - 1);
+        self.to_state.select(Some(i));
+        let next = targets[i];
+        if next != self.to {
+            self.to = next;
+            self.reset_model_selection();
+        }
+    }
+
+    fn reset_model_selection(&mut self) {
+        self.model = catalog::default_model(self.to);
+        self.model_state.select(Some(0));
+        self.reset_effort_selection();
+        self.reset_fast_selection();
+    }
+
+    fn reset_effort_selection(&mut self) {
+        self.effort = catalog::default_effort(self.to, self.model);
+        self.effort_state.select(Some(0));
+    }
+
+    fn reset_fast_selection(&mut self) {
+        self.fast = catalog::default_fast(self.to);
+        self.fast_state.select(Some(0));
+    }
+
+    fn selected_base_model(&self) -> ModelInfo {
         let list = catalog::models_for(self.to);
         self.model_state
             .selected()
             .and_then(|i| list.get(i).copied())
             .unwrap_or_else(|| catalog::default_model(self.to))
+    }
+
+    fn selected_effort(&self) -> EffortChoice {
+        let list = catalog::efforts_for(self.to, self.model);
+        self.effort_state
+            .selected()
+            .and_then(|i| list.get(i).copied())
+            .unwrap_or_else(|| catalog::default_effort(self.to, self.model))
+    }
+
+    fn selected_fast(&self) -> FastChoice {
+        let Some(list) = catalog::fast_options_for(self.to) else {
+            return FastChoice::OFF;
+        };
+        self.fast_state
+            .selected()
+            .and_then(|i| list.get(i).copied())
+            .unwrap_or(FastChoice::OFF)
+    }
+
+    fn resolved_model(&self) -> ModelInfo {
+        catalog::apply_selection(self.model, self.effort, self.fast)
     }
 
     fn reload_sessions(&mut self) {
@@ -154,13 +234,111 @@ impl App {
         if self.from == self.to {
             bail!("source and target must differ");
         }
-        self.model = self.selected_model();
-        let opts = teleport::opts_for_model(self.model, None);
+        self.model = self.selected_base_model();
+        self.effort = self.selected_effort();
+        self.fast = if self.has_fast_step() {
+            self.selected_fast()
+        } else {
+            FastChoice::OFF
+        };
+        let opts = teleport::opts_for_selection(self.model, self.effort, self.fast, None);
         let h = teleport::package(self.from, self.to, &self.cwd, &sess.id, opts)?;
         self.handoff = Some(h);
         self.preview_scroll = 0;
         Ok(())
     }
+
+    fn enter_dest(&mut self) {
+        let targets = target_tools(self.from);
+        self.to = first_target(self.from);
+        let idx = targets.iter().position(|t| *t == self.to).unwrap_or(0);
+        self.to_state.select(Some(idx));
+        self.reset_model_selection();
+        self.dest_focus = DestFocus::Target;
+        self.step = Step::Dest;
+        self.status = format!("pick target + model · {}", self.to.display_name());
+        self.error = None;
+    }
+
+    fn enter_effort(&mut self) {
+        self.sync_target_from_state();
+        self.model = self.selected_base_model();
+        self.reset_effort_selection();
+        self.step = Step::Effort;
+        self.status = format!("{} · pick effort", self.model.label);
+        self.error = None;
+    }
+
+    fn enter_fast_or_preview(&mut self) -> Result<()> {
+        self.effort = self.selected_effort();
+        if self.has_fast_step() {
+            self.reset_fast_selection();
+            self.step = Step::Fast;
+            self.status = format!("{} · fast mode (separate from effort)", self.model.label);
+            self.error = None;
+            Ok(())
+        } else {
+            self.go_preview()
+        }
+    }
+
+    fn go_preview(&mut self) -> Result<()> {
+        self.build_handoff()?;
+        self.step = Step::Preview;
+        self.status = "j/k scroll · enter go · a soft/auto · esc back".into();
+        self.error = None;
+        Ok(())
+    }
+
+    fn refresh_dest_status(&mut self) {
+        self.model = self.selected_base_model();
+        self.status = format!(
+            "{} · {} · pack ~{}k",
+            self.to.display_name(),
+            self.model.label,
+            self.model.handoff_budget_tokens() / 1000
+        );
+    }
+
+    fn step_back(&mut self) {
+        self.step = match self.step {
+            Step::Session => Step::From,
+            Step::Dest => Step::Session,
+            Step::Effort => Step::Dest,
+            Step::Fast => Step::Effort,
+            Step::Preview => {
+                if self.has_fast_step() {
+                    Step::Fast
+                } else {
+                    Step::Effort
+                }
+            }
+            Step::From => Step::From,
+        };
+        self.status = match self.step {
+            Step::From => "where is the conversation?".into(),
+            Step::Session => "select session".into(),
+            Step::Dest => {
+                self.refresh_dest_status();
+                self.status.clone()
+            }
+            Step::Effort => format!("{} · pick effort", self.model.label),
+            Step::Fast => format!("{} · fast mode", self.model.label),
+            Step::Preview => self.status.clone(),
+        };
+        self.error = None;
+    }
+}
+
+fn target_tools(from: Tool) -> Vec<Tool> {
+    Tool::all().into_iter().filter(|t| *t != from).collect()
+}
+
+fn first_target(from: Tool) -> Tool {
+    target_tools(from)
+        .into_iter()
+        .next()
+        .unwrap_or(Tool::Grok)
 }
 
 pub fn run(cwd: PathBuf) -> Result<()> {
@@ -212,17 +390,13 @@ fn event_loop(
                 if app.step == Step::From {
                     return Ok(None);
                 }
-                app.step = match app.step {
-                    Step::Session => Step::From,
-                    Step::To => Step::Session,
-                    Step::Model => Step::To,
-                    Step::Preview => Step::Model,
-                    Step::From => Step::From,
-                };
-                app.error = None;
+                app.step_back();
             }
             KeyCode::Char('a')
-                if matches!(app.step, Step::Preview | Step::Model | Step::To) =>
+                if matches!(
+                    app.step,
+                    Step::Preview | Step::Effort | Step::Fast | Step::Dest
+                ) =>
             {
                 app.auto_send = !app.auto_send;
                 app.status = if app.auto_send {
@@ -231,54 +405,38 @@ fn event_loop(
                     "soft on — CLI opens empty; paste ⌘V then send".into()
                 };
             }
+            KeyCode::Left | KeyCode::Char('h') if app.step == Step::Dest => {
+                app.dest_focus = DestFocus::Target;
+            }
+            KeyCode::Right | KeyCode::Char('l') if app.step == Step::Dest => {
+                app.dest_focus = DestFocus::Model;
+            }
             KeyCode::Enter => match app.step {
                 Step::From => {
                     if let Some(i) = app.tool_state.selected() {
                         app.from = Tool::all()[i];
-                        app.to = Tool::all()
-                            .into_iter()
-                            .find(|t| *t != app.from)
-                            .unwrap_or(Tool::Grok);
-                        app.to_state
-                            .select(Tool::all().iter().position(|t| *t == app.to));
-                        app.sync_model_list();
                         app.reload_sessions();
                         app.step = Step::Session;
+                        app.filter.clear();
+                        app.apply_filter();
                         app.status = "select session".into();
+                        app.error = None;
                     }
                 }
                 Step::Session => {
                     if app.selected_session().is_some() {
-                        app.step = Step::To;
-                        app.status = "select target CLI".into();
+                        app.enter_dest();
                     }
                 }
-                Step::To => {
-                    if let Some(i) = app.to_state.selected() {
-                        let next = Tool::all()[i];
-                        if next == app.from {
-                            app.error = Some("source and target must differ".into());
-                        } else {
-                            app.to = next;
-                            app.sync_model_list();
-                            app.step = Step::Model;
-                            app.status = format!(
-                                "select model · budget ~{}k tokens",
-                                app.model.handoff_budget_tokens() / 1000
-                            );
-                            app.error = None;
-                        }
+                Step::Dest => app.enter_effort(),
+                Step::Effort => {
+                    if let Err(e) = app.enter_fast_or_preview() {
+                        app.error = Some(e.to_string());
                     }
                 }
-                Step::Model => {
-                    app.model = app.selected_model();
-                    match app.build_handoff() {
-                        Ok(()) => {
-                            app.step = Step::Preview;
-                            app.status = "j/k scroll · enter go · a auto-send · esc back".into();
-                            app.error = None;
-                        }
-                        Err(e) => app.error = Some(e.to_string()),
+                Step::Fast => {
+                    if let Err(e) = app.go_preview() {
+                        app.error = Some(e.to_string());
                     }
                 }
                 Step::Preview => return Ok(app.handoff.clone()),
@@ -301,7 +459,7 @@ fn event_loop(
             KeyCode::Char(c)
                 if app.step == Step::Session && !key.modifiers.contains(KeyModifiers::CONTROL) =>
             {
-                if c != 'j' && c != 'k' && c != 'q' && c != 'a' {
+                if c != 'j' && c != 'k' && c != 'q' && c != 'a' && c != 'h' && c != 'l' {
                     app.filter.push(c);
                     app.apply_filter();
                 } else if c == 'j' {
@@ -332,22 +490,58 @@ fn move_sel(app: &mut App, delta: i32) {
             app.session_state
                 .select(Some((cur + delta).rem_euclid(len) as usize));
         }
-        Step::To => {
-            let len = Tool::all().len() as i32;
-            let cur = app.to_state.selected().unwrap_or(0) as i32;
-            app.to_state
+        Step::Dest => match app.dest_focus {
+            DestFocus::Target => {
+                let len = app.targets().len() as i32;
+                if len == 0 {
+                    return;
+                }
+                let cur = app.to_state.selected().unwrap_or(0) as i32;
+                app.to_state
+                    .select(Some((cur + delta).rem_euclid(len) as usize));
+                app.sync_target_from_state();
+                app.refresh_dest_status();
+            }
+            DestFocus::Model => {
+                let len = catalog::models_for(app.to).len() as i32;
+                if len == 0 {
+                    return;
+                }
+                let cur = app.model_state.selected().unwrap_or(0) as i32;
+                app.model_state
+                    .select(Some((cur + delta).rem_euclid(len) as usize));
+                app.model = app.selected_base_model();
+                app.refresh_dest_status();
+            }
+        },
+        Step::Effort => {
+            let len = catalog::efforts_for(app.to, app.model).len() as i32;
+            if len == 0 {
+                return;
+            }
+            let cur = app.effort_state.selected().unwrap_or(0) as i32;
+            app.effort_state
                 .select(Some((cur + delta).rem_euclid(len) as usize));
-        }
-        Step::Model => {
-            let len = catalog::models_for(app.to).len() as i32;
-            let cur = app.model_state.selected().unwrap_or(0) as i32;
-            let next = (cur + delta).rem_euclid(len) as usize;
-            app.model_state.select(Some(next));
-            app.model = catalog::models_for(app.to)[next];
+            app.effort = app.selected_effort();
             app.status = format!(
-                "{} · pack up to ~{}k tokens",
-                app.model.id,
-                app.model.handoff_budget_tokens() / 1000
+                "{} · {}",
+                app.model.label,
+                catalog::selection_key(app.model, app.effort, FastChoice::OFF)
+            );
+        }
+        Step::Fast => {
+            let Some(list) = catalog::fast_options_for(app.to) else {
+                return;
+            };
+            let len = list.len() as i32;
+            let cur = app.fast_state.selected().unwrap_or(0) as i32;
+            app.fast_state
+                .select(Some((cur + delta).rem_euclid(len) as usize));
+            app.fast = app.selected_fast();
+            app.status = format!(
+                "{} · {}",
+                app.model.label,
+                catalog::selection_key(app.model, app.effort, app.fast)
             );
         }
         Step::Preview => {
@@ -360,7 +554,7 @@ fn move_sel(app: &mut App, delta: i32) {
 fn ui(f: &mut Frame, app: &App) {
     let area = f.area();
     let logo = brand::logo_lines_for(area.width);
-    let header_h = (logo.len() as u16).saturating_add(2); // logo + route + bottom rule
+    let header_h = (logo.len() as u16).saturating_add(4);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -370,23 +564,10 @@ fn ui(f: &mut Frame, app: &App) {
         ])
         .split(area);
 
-    // CLI-style wordmark stays for the whole session (Codex/Claude splash family).
     let mut header = logo;
-    header.push(Line::from(vec![
-        Span::styled(app.from.display_name(), brand::body()),
-        Span::styled(" → ", brand::muted()),
-        Span::styled(app.to.display_name(), brand::body()),
-        Span::styled("  ", brand::muted()),
-        Span::styled(app.model.id, brand::accent()),
-        Span::styled(
-            format!("  ~{}k", app.model.handoff_budget_tokens() / 1000),
-            brand::muted(),
-        ),
-        Span::styled(
-            if app.auto_send { "  auto" } else { "  soft" },
-            brand::muted(),
-        ),
-    ]));
+    header.push(brand::tagline());
+    header.push(step_line(app));
+    header.push(route_line(app));
 
     f.render_widget(
         Paragraph::new(header).block(
@@ -398,10 +579,11 @@ fn ui(f: &mut Frame, app: &App) {
     );
 
     match app.step {
-        Step::From => render_tool_list(f, chunks[1], "from", &app.tool_state, None),
+        Step::From => render_from(f, chunks[1], app),
         Step::Session => render_sessions(f, chunks[1], app),
-        Step::To => render_tool_list(f, chunks[1], "to", &app.to_state, Some(app.from)),
-        Step::Model => render_models(f, chunks[1], app),
+        Step::Dest => render_dest(f, chunks[1], app),
+        Step::Effort => render_effort(f, chunks[1], app),
+        Step::Fast => render_fast(f, chunks[1], app),
         Step::Preview => render_preview(f, chunks[1], app),
     }
 
@@ -412,8 +594,12 @@ fn ui(f: &mut Frame, app: &App) {
         )))
     } else {
         let keys = match app.step {
-            Step::Preview => "j/k pgup/pgdn  enter  esc  a  q",
-            _ => "j/k  enter  esc  a  q",
+            Step::Preview => "j/k · pgup/pgdn · enter go · esc · a soft/auto · q",
+            Step::Session => "type to filter · j/k · enter · esc · q",
+            Step::Dest => "h/l panes · j/k · enter · a soft · esc · q",
+            Step::Effort => "j/k · enter · a soft · esc · q",
+            Step::Fast => "j/k · enter package · a soft · esc · q",
+            Step::From => "j/k · enter · esc · q",
         };
         Paragraph::new(Line::from(vec![
             Span::styled(&app.status, brand::muted()),
@@ -423,67 +609,237 @@ fn ui(f: &mut Frame, app: &App) {
     f.render_widget(footer, chunks[2]);
 }
 
-fn panel(title: &str) -> Block<'_> {
-    Block::default()
-        .borders(Borders::ALL)
-        .border_style(brand::dim_border())
-        .title(Span::styled(format!(" {title} "), brand::accent()))
+fn step_line(app: &App) -> Line<'static> {
+    let mut steps = vec![
+        (Step::From, "from"),
+        (Step::Session, "session"),
+        (Step::Dest, "model"),
+        (Step::Effort, "effort"),
+    ];
+    if app.has_fast_step() || matches!(app.step, Step::Fast) {
+        steps.push((Step::Fast, "fast"));
+    }
+    steps.push((Step::Preview, "go"));
+
+    let mut spans = Vec::new();
+    for (i, (step, label)) in steps.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("  ·  ", brand::dim_border()));
+        }
+        if *step == app.step {
+            spans.push(Span::styled(format!("● {label}"), brand::accent_bold()));
+        } else {
+            spans.push(Span::styled(format!("○ {label}"), brand::muted()));
+        }
+    }
+    Line::from(spans).alignment(Alignment::Center)
 }
 
-fn render_tool_list(
-    f: &mut Frame,
-    area: Rect,
-    title: &str,
-    state: &ListState,
-    exclude: Option<Tool>,
-) {
+fn route_line(app: &App) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled(app.from.display_name().to_string(), brand::body()),
+        Span::styled(" → ", brand::accent()),
+        Span::styled(app.to.display_name().to_string(), brand::body()),
+    ];
+    if matches!(
+        app.step,
+        Step::Dest | Step::Effort | Step::Fast | Step::Preview
+    ) {
+        spans.push(Span::styled("  ·  ", brand::muted()));
+        spans.push(Span::styled(app.model.label.to_string(), brand::accent()));
+    }
+    if matches!(app.step, Step::Effort | Step::Fast | Step::Preview) {
+        if app.effort.is_default() {
+            spans.push(Span::styled(" · default", brand::muted()));
+        } else {
+            spans.push(Span::styled(
+                format!(" · {}", app.effort.label),
+                brand::accent(),
+            ));
+        }
+    }
+    if matches!(app.step, Step::Fast | Step::Preview) && app.has_fast_step() {
+        spans.push(Span::styled(
+            if app.fast.on {
+                " · fast"
+            } else {
+                " · standard"
+            },
+            if app.fast.on {
+                brand::accent()
+            } else {
+                brand::muted()
+            },
+        ));
+    }
+    if matches!(
+        app.step,
+        Step::Dest | Step::Effort | Step::Fast | Step::Preview
+    ) {
+        let m = if matches!(app.step, Step::Effort | Step::Fast | Step::Preview) {
+            app.resolved_model()
+        } else {
+            app.model
+        };
+        spans.push(Span::styled(
+            format!("  ·  ~{}k", m.handoff_budget_tokens() / 1000),
+            brand::muted(),
+        ));
+    }
+    spans.push(Span::styled(
+        if app.auto_send {
+            "  ·  auto"
+        } else {
+            "  ·  soft"
+        },
+        brand::muted(),
+    ));
+    Line::from(spans).alignment(Alignment::Center)
+}
+
+fn panel(title: &str, focused: bool) -> Block<'_> {
+    let border = if focused {
+        brand::accent()
+    } else {
+        brand::dim_border()
+    };
+    let title_style = if focused {
+        brand::accent_bold()
+    } else {
+        brand::muted()
+    };
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(border)
+        .title(Span::styled(format!(" {title} "), title_style))
+}
+
+fn render_from(f: &mut Frame, area: Rect, app: &App) {
     let items: Vec<ListItem> = Tool::all()
         .into_iter()
         .map(|t| {
-            if exclude == Some(t) {
-                ListItem::new(Line::from(Span::styled(
-                    format!("{}  · source", t.display_name()),
-                    brand::muted(),
-                )))
-            } else {
-                ListItem::new(Line::from(Span::styled(
-                    t.display_name(),
-                    brand::body(),
-                )))
-            }
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{:<12}", t.display_name()), brand::body()),
+                Span::styled(t.binary_name().to_string(), brand::muted()),
+            ]))
         })
         .collect();
     let list = List::new(items)
-        .block(panel(title))
+        .block(panel("where is the conversation?", true))
         .highlight_style(brand::select())
         .highlight_symbol("▸ ");
-    let mut st = *state;
+    let mut st = app.tool_state;
     f.render_stateful_widget(list, area, &mut st);
 }
 
-fn render_models(f: &mut Frame, area: Rect, app: &App) {
+fn render_dest(f: &mut Frame, area: Rect, app: &App) {
+    let wide = area.width >= 72;
+    let (target_area, model_area) = if wide {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(28), Constraint::Min(30)])
+            .split(area);
+        (cols[0], cols[1])
+    } else {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(6), Constraint::Min(4)])
+            .split(area);
+        (rows[0], rows[1])
+    };
+
+    render_target_pane(f, target_area, app);
+    render_model_pane(f, model_area, app);
+}
+
+fn render_target_pane(f: &mut Frame, area: Rect, app: &App) {
+    let focused = app.dest_focus == DestFocus::Target;
+    let items: Vec<ListItem> = app
+        .targets()
+        .into_iter()
+        .map(|t| {
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{:<14}", t.display_name()), brand::body()),
+                Span::styled(t.binary_name().to_string(), brand::muted()),
+            ]))
+        })
+        .collect();
+    let title = if focused { "target ▸" } else { "target" };
+    let list = List::new(items)
+        .block(panel(title, focused))
+        .highlight_style(brand::select())
+        .highlight_symbol("▸ ");
+    let mut st = app.to_state;
+    f.render_stateful_widget(list, area, &mut st);
+}
+
+fn render_model_pane(f: &mut Frame, area: Rect, app: &App) {
+    let focused = app.dest_focus == DestFocus::Model;
     let items: Vec<ListItem> = catalog::models_for(app.to)
         .iter()
         .map(|m| {
             ListItem::new(Line::from(vec![
-                Span::styled(format!("{:<12}", m.label), brand::body()),
-                Span::styled(
-                    format!(
-                        "{}   pack ~{}k",
-                        m.id,
-                        m.handoff_budget_tokens() / 1000
-                    ),
-                    brand::muted(),
-                ),
+                Span::styled(format!("{:<14}", m.label), brand::body()),
+                Span::styled(m.cli_model.to_string(), brand::muted()),
             ]))
         })
         .collect();
-    let title = format!("model · {}", app.to.display_name());
+    let title = if focused { "model ▸" } else { "model" };
     let list = List::new(items)
-        .block(panel(&title))
+        .block(panel(title, focused))
         .highlight_style(brand::select())
         .highlight_symbol("▸ ");
     let mut st = app.model_state;
+    f.render_stateful_widget(list, area, &mut st);
+}
+
+fn render_effort(f: &mut Frame, area: Rect, app: &App) {
+    let wire_hint = match app.to {
+        Tool::Codex => "codex -c model_reasoning_effort=…",
+        Tool::Grok => "grok --effort …",
+        Tool::Claude => "claude --effort …",
+    };
+    let items: Vec<ListItem> = catalog::efforts_for(app.to, app.model)
+        .iter()
+        .map(|e| {
+            let hint = e.effort.unwrap_or("omit (CLI default)");
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{:<12}", e.label), brand::body()),
+                Span::styled(hint.to_string(), brand::muted()),
+            ]))
+        })
+        .collect();
+    let title = format!("effort · {} · {wire_hint}", app.model.label);
+    let list = List::new(items)
+        .block(panel(&title, true))
+        .highlight_style(brand::select())
+        .highlight_symbol("▸ ");
+    let mut st = app.effort_state;
+    f.render_stateful_widget(list, area, &mut st);
+}
+
+fn render_fast(f: &mut Frame, area: Rect, app: &App) {
+    let items: Vec<ListItem> = catalog::fast_options_for(app.to)
+        .unwrap_or(&[])
+        .iter()
+        .map(|fc| {
+            let hint = if fc.on {
+                "--enable fast_mode  (service tier; not effort)"
+            } else {
+                "standard speed"
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{:<12}", fc.label), brand::body()),
+                Span::styled(hint.to_string(), brand::muted()),
+            ]))
+        })
+        .collect();
+    let title = format!("fast · {} · separate from effort", app.model.label);
+    let list = List::new(items)
+        .block(panel(&title, true))
+        .highlight_style(brand::select())
+        .highlight_symbol("▸ ");
+    let mut st = app.fast_state;
     f.render_stateful_widget(list, area, &mut st);
 }
 
@@ -511,7 +867,7 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &App) {
         format!("session · /{}", app.filter)
     };
     let list = List::new(items)
-        .block(panel(&title))
+        .block(panel(&title, true))
         .highlight_style(brand::select())
         .highlight_symbol("▸ ");
     let mut st = app.session_state;
@@ -538,7 +894,7 @@ fn render_preview(f: &mut Frame, area: Rect, app: &App) {
     let para = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0))
-        .block(panel(&title));
+        .block(panel(&title, true));
     f.render_widget(para, area);
 }
 
@@ -563,10 +919,14 @@ fn style_preview_line(raw: &str) -> Line<'static> {
     if s.starts_with("tool  ") {
         return Line::from(Span::styled(s, brand::tool()));
     }
-    if s.starts_with("Rules:") || s.starts_with("warn:") || s.starts_with("model:") {
-        return Line::from(Span::styled(s, brand::muted()));
-    }
-    if s.starts_with("cwd:") || s.starts_with("branch:") || s.starts_with("session:") || s.starts_with("turns:") {
+    if s.starts_with("Prior context")
+        || s.starts_with("warn:")
+        || s.starts_with("model:")
+        || s.starts_with("to:")
+        || s.starts_with("cwd:")
+        || s.starts_with("session:")
+        || s.starts_with("kept:")
+    {
         return Line::from(Span::styled(s, brand::muted()));
     }
     Line::from(Span::styled(s, brand::body()))
@@ -579,4 +939,16 @@ fn truncate(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
     out.push('…');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_tools_excludes_source() {
+        let t = target_tools(Tool::Codex);
+        assert!(!t.contains(&Tool::Codex));
+        assert_eq!(t.len(), 2);
+    }
 }

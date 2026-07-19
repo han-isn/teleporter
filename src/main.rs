@@ -67,7 +67,7 @@ enum Commands {
         last: bool,
         #[arg(long)]
         cwd: Option<PathBuf>,
-        /// Target model id (e.g. grok-4.5, gpt-5.4, sonnet)
+        /// Target model id (e.g. sol, terra, fable, opus, claude-sonnet-5)
         #[arg(long, short = 'm')]
         model: Option<String>,
         /// Override transcript token budget (default: from model context, capped ~200k)

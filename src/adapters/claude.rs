@@ -54,6 +54,18 @@ fn encode_claude_project(cwd: &Path) -> String {
     out
 }
 
+fn claude_session_id(path: &Path) -> String {
+    // Prefer parent dir name when layout is {uuid}/{uuid}.jsonl or {uuid}/session.jsonl
+    if let Some(parent) = path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) {
+        if parent.len() >= 32 && parent.contains('-') {
+            return parent.to_string();
+        }
+    }
+    path.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".into())
+}
+
 impl Adapter for ClaudeAdapter {
     fn list(&self, cwd: &Path) -> Result<Vec<SessionSummary>> {
         let projects = self.projects_root()?;
@@ -63,9 +75,10 @@ impl Adapter for ClaudeAdapter {
         }
 
         let mut sessions = Vec::new();
+        let mut nested_only = 0usize;
         for entry in WalkDir::new(&project_dir)
             .follow_links(false)
-            .max_depth(2)
+            .max_depth(3)
             .into_iter()
             .filter_map(|e| e.ok())
         {
@@ -81,13 +94,11 @@ impl Adapter for ClaudeAdapter {
                 .components()
                 .any(|c| c.as_os_str() == "subagents")
             {
+                nested_only += 1;
                 continue;
             }
 
-            let id = path
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "unknown".into());
+            let id = claude_session_id(path);
 
             let Ok(head) = read_claude_head(path) else {
                 continue;
@@ -110,6 +121,7 @@ impl Adapter for ClaudeAdapter {
 
             let title = head
                 .first_user
+                .filter(|t| !super::common::is_noise_user_text(t))
                 .map(|s| truncate_title(&s, 120))
                 .unwrap_or_else(|| id.clone());
 
@@ -122,6 +134,14 @@ impl Adapter for ClaudeAdapter {
                 updated_at: updated,
                 branch: head.branch,
             });
+        }
+
+        if sessions.is_empty() && nested_only > 0 {
+            // Surface why list is empty — only subagent stubs remain.
+            eprintln!(
+                "teleporter: found {nested_only} Claude subagent transcripts under {} but no parent session jsonl",
+                project_dir.display()
+            );
         }
 
         Ok(super::common::finalize_sessions(sessions))
@@ -230,8 +250,50 @@ fn parse_claude_jsonl(path: &Path) -> Result<Transcript> {
         let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
         match ty {
             "user" => {
-                if let Some(text) = claude_message_text(&v) {
-                    if text == "Warmup" {
+                // Claude nests tool_result blocks inside user messages.
+                if let Some(arr) = v.pointer("/message/content").and_then(|c| c.as_array()) {
+                    let mut text_parts = Vec::new();
+                    for item in arr {
+                        let bty = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                        match bty {
+                            "tool_result" => {
+                                let out = tool_result_text(item);
+                                turns.push(Turn {
+                                    role: TurnRole::Tool,
+                                    text: format!("result: {out}"),
+                                    tool_name: None,
+                                });
+                            }
+                            "text" => {
+                                if let Some(t) = item.get("text").and_then(|x| x.as_str()) {
+                                    text_parts.push(t.to_string());
+                                }
+                            }
+                            _ => {
+                                if let Some(t) = item.as_str() {
+                                    text_parts.push(t.to_string());
+                                }
+                            }
+                        }
+                    }
+                    let text = text_parts.join("\n");
+                    if !text.is_empty()
+                        && text != "Warmup"
+                        && !super::common::is_noise_user_text(&text)
+                    {
+                        for p in extract_paths(&text) {
+                            if !files.contains(&p) {
+                                files.push(p);
+                            }
+                        }
+                        turns.push(Turn {
+                            role: TurnRole::User,
+                            text,
+                            tool_name: None,
+                        });
+                    }
+                } else if let Some(text) = claude_message_text(&v) {
+                    if text == "Warmup" || super::common::is_noise_user_text(&text) {
                         continue;
                     }
                     for p in extract_paths(&text) {
@@ -307,12 +369,8 @@ fn parse_claude_jsonl(path: &Path) -> Result<Transcript> {
     }
 
     let last_user_request = super::common::derive_last_user(&turns);
-    let title = turns
-        .iter()
-        .find(|t| t.role == TurnRole::User)
-        .map(|t| truncate_title(&t.text, 120))
-        .unwrap_or_else(|| session_id.clone());
-
+    let title = super::common::derive_title(&turns, &session_id);
+    files.retain(|p| super::common::is_useful_file_mention(p));
     files.truncate(20);
 
     Ok(Transcript {
@@ -340,6 +398,9 @@ fn claude_message_text(v: &Value) -> Option<String> {
     if let Some(arr) = content.as_array() {
         let mut parts = Vec::new();
         for item in arr {
+            if item.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
+                continue;
+            }
             if let Some(t) = item.get("text").and_then(|x| x.as_str()) {
                 parts.push(t);
             } else if let Some(s) = item.as_str() {
@@ -351,6 +412,27 @@ fn claude_message_text(v: &Value) -> Option<String> {
         }
     }
     None
+}
+
+fn tool_result_text(item: &Value) -> String {
+    if let Some(s) = item.get("content").and_then(|c| c.as_str()) {
+        return truncate_title(s, 80);
+    }
+    if let Some(arr) = item.get("content").and_then(|c| c.as_array()) {
+        let mut parts = Vec::new();
+        for x in arr {
+            if let Some(t) = x.get("text").and_then(|t| t.as_str()) {
+                parts.push(t);
+            }
+        }
+        if !parts.is_empty() {
+            return truncate_title(&parts.join(" "), 80);
+        }
+    }
+    if item.get("is_error").and_then(|e| e.as_bool()) == Some(true) {
+        return "fail".into();
+    }
+    "ok".into()
 }
 
 #[cfg(test)]

@@ -242,7 +242,8 @@ fn parse_grok_session(dir: &Path) -> Result<Transcript> {
     }
 
     let last_user_request = super::common::derive_last_user(&turns);
-
+    let title = super::common::derive_title(&turns, &title);
+    files.retain(|p| super::common::is_useful_file_mention(p));
     files.truncate(20);
 
     Ok(Transcript {

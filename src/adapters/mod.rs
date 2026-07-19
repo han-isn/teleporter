@@ -83,6 +83,9 @@ pub(crate) fn extract_paths(text: &str) -> Vec<String> {
         }
         // Drop trailing :line
         let t = t.split(':').next().unwrap_or(t);
+        if !common::is_useful_file_mention(t) {
+            continue;
+        }
         if t.contains('/')
             && (t.starts_with('/')
                 || t.starts_with("./")
@@ -93,6 +96,7 @@ pub(crate) fn extract_paths(text: &str) -> Vec<String> {
                 || t.ends_with(".ts")
                 || t.ends_with(".tsx")
                 || t.ends_with(".js")
+                || t.ends_with(".mjs")
                 || t.ends_with(".py")
                 || t.ends_with(".md")
                 || t.ends_with(".toml")
